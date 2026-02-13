@@ -1,0 +1,14 @@
+# Data volumes
+data/
+
+# Environment overrides
+.env
+
+# Database schema (downloaded at setup time)
+init-schema.sql
+
+# Shared directory (custom genesis configs)
+shared/
+
+# macOS
+.DS_Store
