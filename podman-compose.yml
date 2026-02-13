@@ -1,0 +1,215 @@
+version: '3.8'
+services:
+  # PostgreSQL Database
+  postgres:
+    image: docker.io/postgres:15-alpine
+    container_name: mina-archive-postgres
+    platform: ${PLATFORM:-linux/arm64}
+    environment:
+      POSTGRES_USER: mina
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mina_dev_password}
+      POSTGRES_DB: archive
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        echo "ALTER DATABASE archive SET DEFAULT_TRANSACTION_ISOLATION TO SERIALIZABLE;" \
+          > /docker-entrypoint-initdb.d/zzz-post-init-config.sql
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./init-schema.sql:/docker-entrypoint-initdb.d/init-schema.sql:ro
+    ports:
+      - "5433:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+          cpus: "3.00"
+        reservations:
+          memory: 3G
+          cpus: "2.00"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mina -d archive"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mina-network
+  # Archive Dump Loader (recommended)
+  # Pre-loads the archive database from a SQL dump. Strongly recommended:
+  # without it, the archive starts empty and only records new blocks after
+  # the daemon fully syncs, missing all historical data.
+  dump-loader:
+    image: docker.io/postgres:15-alpine
+    container_name: mina-dump-loader
+    platform: ${PLATFORM:-linux/arm64}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD:-mina_dev_password}
+      - ARCHIVE_DUMP_URL=${ARCHIVE_DUMP_URL:-https://storage.googleapis.com/mina-archive-dumps/devnet-archive-dump-2026-02-13_0900.sql.tar.gz}
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        if [ -z "$${ARCHIVE_DUMP_URL:-}" ]; then
+          echo "No ARCHIVE_DUMP_URL set, skipping dump load"
+          exit 0
+        fi
+
+        until pg_isready -h postgres -p 5432 -U mina; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+
+        TABLE_EXISTS=$$(psql -h postgres -U mina -d archive -t -c \
+          "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='blocks'" | tr -d ' ')
+
+        RECORD_COUNT=0
+        if [ "$$TABLE_EXISTS" -ne "0" ]; then
+          RECORD_COUNT=$$(psql -h postgres -U mina -d archive -t -c \
+            "SELECT COUNT(*) FROM blocks" | tr -d ' ')
+        fi
+
+        if [ "$$TABLE_EXISTS" -eq "0" ] || [ "$$RECORD_COUNT" -le "1" ]; then
+          echo "Loading archive dump from $${ARCHIVE_DUMP_URL}..."
+          apk add --no-cache curl
+          cd /tmp
+          curl -L "$${ARCHIVE_DUMP_URL}" -o dump.tar.gz
+          tar -xzf dump.tar.gz
+          DUMP_FILE=$$(find /tmp -type f -name "*.sql" | head -n 1)
+          if [ -n "$$DUMP_FILE" ]; then
+            psql -h postgres -U mina -d archive -f "$$DUMP_FILE"
+            rm -f "$$DUMP_FILE" /tmp/dump.tar.gz
+            echo "Archive dump loaded successfully"
+          else
+            echo "ERROR: No SQL file found in dump archive"
+            exit 1
+          fi
+        else
+          echo "Data already loaded ($${RECORD_COUNT} blocks), skipping"
+        fi
+    networks:
+      - mina-network
+  # Mina Archive Node
+  mina-archive:
+    image: ${ARCHIVE_IMAGE:-europe-west3-docker.pkg.dev/o1labs-192920/euro-docker-repo/mina-archive:3.3.0-compatible-cc77620-noble-devnet-arm64}
+    container_name: mina-archive
+    platform: ${PLATFORM:-linux/arm64}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mina_dev_password}
+    entrypoint:
+      - mina-archive
+      - run
+      - -metrics-port
+      - "10002"
+      - -server-port
+      - "3086"
+      - --log-json
+      - --log-level
+      - Spam
+      - -postgres-uri
+      - postgres://mina:${POSTGRES_PASSWORD:-mina_dev_password}@postgres:5432/archive
+    ports:
+      - "3086:3086"
+      - "10002:10002"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: "6.00"
+        reservations:
+          memory: 4G
+          cpus: "4.00"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:10002/metrics || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - mina-network
+  # Mina Plain Node (feeds archive)
+  #
+  # CUSTOMIZATION NOTES:
+  #
+  # 1. Network Config Cleanup (rm -f /var/lib/coda/*.json):
+  #    This line clears any cached network configuration files, ensuring
+  #    the node starts fresh with the provided configuration. This is
+  #    useful for development/testing where you want deterministic behavior.
+  #
+  #    For official networks (mainnet, devnet) where you want faster restarts
+  #    and to preserve cached peer lists, REMOVE this line from the command.
+  #
+  # 2. Genesis Config (-config-file):
+  #    By default, Mina daemon images include the genesis configuration for
+  #    official networks (mainnet, devnet). The -config-file flag is only
+  #    needed when using a CUSTOM genesis for private/test networks.
+  #
+  #    For official networks, REMOVE the -config-file flag entirely.
+  #    The node will use the embedded default genesis config.
+  #
+  mina-daemon:
+    image: ${DAEMON_IMAGE:-gcr.io/o1labs-192920/mina-daemon:3.3.1-7b34378-noble-devnet-arm64}
+    container_name: mina-daemon
+    platform: ${PLATFORM:-linux/arm64}
+    depends_on:
+      mina-archive:
+        condition: service_healthy
+    volumes:
+      - ./shared:/shared:ro
+      - ./data/mina:/root/.mina-config
+    environment:
+      - PEER_LIST_URL=${PEER_LIST_URL:-https://bootnodes.minaprotocol.com/networks/devnet.txt}
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        # rm -f /var/lib/coda/*.json # NOTE: Remove this comment to clear baked network config on each start
+        exec mina daemon \
+          -log-level Spam \
+          -log-json \
+          -config-directory /root/.mina-config \
+          -rest-port 3085 \
+          -external-port 10003 \
+          -metrics-port 8081 \
+          -enable-peer-exchange true \
+          --max-connections 200 \
+          -peer-list-url ${PEER_LIST_URL} \
+          -generate-genesis-proof true \
+          -insecure-rest-server \
+          -archive-address mina-archive:3086
+    ports:
+      - "3085:3085" # GraphQL
+      - "10003:10003" # P2P
+      - "8081:8081" # Metrics
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+          cpus: "8.00"
+        reservations:
+          memory: 8G
+          cpus: "6.00"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3085/graphql -X POST -H 'Content-Type: application/json' -d '{\"query\":\"{syncStatus}\"}' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    networks:
+      - mina-network
+networks:
+  mina-network:
+    driver: bridge
+volumes:
+  postgres-data:
+  mina-data:
